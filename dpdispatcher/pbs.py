@@ -9,7 +9,6 @@ pbs_script_header_template = """
 #!/bin/bash -l
 {select_node_line}
 #PBS -j oe
-{queue_name_line}
 """
 
 
@@ -23,11 +22,11 @@ class PBS(Machine):
         pbs_script_header_dict = {}
         pbs_script_header_dict[
             "select_node_line"
-        ] = f"#PBS -l select={resources.number_node}:ncpus={resources.cpu_per_node}"
+        ] = "#PBS -l nodes={number_node}:ppn={cpu_per_node}".format(
+            number_node=resources.number_node, cpu_per_node=resources.cpu_per_node
+        )
         if resources.gpu_per_node != 0:
-            pbs_script_header_dict[
-                "select_node_line"
-            ] += f":ngpus={resources.gpu_per_node}"
+            pbs_script_header_dict["select_node_line"] += f":gpus={resources.gpu_per_node}"
         pbs_script_header_dict["queue_name_line"] = f"#PBS -q {resources.queue_name}"
         if (
             resources["strategy"].get("customized_script_header_template_file")
@@ -55,12 +54,35 @@ class PBS(Machine):
         # self.context.write_file(fname=os.path.join(self.context.submission.work_base, script_file_name), write_str=script_str)
         # script_file_dir = os.path.join(self.context.submission.work_base)
         script_file_dir = self.context.remote_root
-        # stdin, stdout, stderr = self.context.block_checkcall('cd %s && %s %s' % (self.context.remote_root, 'qsub', script_file_name))
-        stdin, stdout, stderr = self.context.block_checkcall(
-            "cd {} && {} {}".format(
-                shlex.quote(script_file_dir), "qsub", shlex.quote(script_file_name)
+
+        def hortense_resources(s:str):
+            valid_strings = ["cpu_milan", "cpu_rome_all","cpu_rome_512","cpu_rome","debug_rome","gpu_rome_a100_40","gpu_rome_a100_80","gpu_rome_a100"]
+            
+            # Extend valid_strings with cluster/dodrio/ prefix
+            extended_valid_strings = valid_strings + ["cluster/dodrio/" + item for item in valid_strings]
+            
+            # Check if string starts with cluster/dodrio/ and prepend if needed
+            if not s.startswith("cluster/dodrio/"):
+                s = "cluster/dodrio/" + s
+
+            # Check if string is in the extended list
+            if s in extended_valid_strings:
+                return s  
+            else:
+                return None
+            
+        cluster = hortense_resources(job.resources.queue_name)
+        if cluster is not None:
+            stdin, stdout, stderr = self.context.block_checkcall(f'module swap {cluster} && cd {script_file_dir} && qsub {script_file_name}')
+        elif job.resources.gpu_per_node != 0:
+            stdin, stdout, stderr = self.context.block_checkcall(
+                "module swap cluster/dodrio/gpu_rome_a100 && cd %s && %s %s"
+                % (script_file_dir, "qsub", script_file_name)
             )
-        )
+        else:
+            stdin, stdout, stderr = self.context.block_checkcall(
+                "cd %s && %s %s" % (script_file_dir, "qsub", script_file_name)
+            )
         subret = stdout.readlines()
         job_id = subret[0].split()[0]
         self.context.write_file(job_id_name, job_id)
@@ -73,10 +95,15 @@ class PBS(Machine):
         job_id = job.job_id
         if job_id == "":
             return JobStatus.unsubmitted
-        ret, stdin, stdout, stderr = self.context.block_call("qstat -x " + job_id)
+        ret, stdin, stdout, stderr = self.context.block_call("qstat " + job_id)
         err_str = stderr.read().decode("utf-8")
+
         if ret != 0:
-            if "qstat: Unknown Job Id" in err_str or "Job has finished" in err_str:
+            if (
+                str("qstat: Unknown Job Id") in err_str
+                or str("Job has finished") in err_str
+                or str("Invalid job id specified") in err_str
+            ):
                 if self.check_finish_tag(job=job):
                     return JobStatus.finished
                 else:
@@ -86,10 +113,10 @@ class PBS(Machine):
                     "status command qstat fails to execute. erro info: %s return code %d"
                     % (err_str, ret)
                 )
-        status_line = stdout.read().decode("utf-8").split("\n")[-2]
+        status_line = stdout.read().decode("utf-8").split("\n")[2]
         status_word = status_line.split()[-2]
         # dlog.info (status_word)
-        if status_word in ["Q", "H"]:
+        if status_word in ["Q", "H", "U"]:
             return JobStatus.waiting
         elif status_word in ["R"]:
             return JobStatus.running
@@ -123,10 +150,13 @@ class Torque(PBS):
         job_id = job.job_id
         if job_id == "":
             return JobStatus.unsubmitted
-        ret, stdin, stdout, stderr = self.context.block_call("qstat -l " + job_id)
+        ret, stdin, stdout, stderr = self.context.block_call("qstat " + job_id)
         err_str = stderr.read().decode("utf-8")
         if ret != 0:
-            if "qstat: Unknown Job Id" in err_str or "Job has finished" in err_str:
+            if (
+                str("qstat: Unknown Job Id") in err_str
+                or str("Job has finished") in err_str
+            ):
                 if self.check_finish_tag(job=job):
                     return JobStatus.finished
                 else:
@@ -163,7 +193,7 @@ class Torque(PBS):
             pbs_script_header_dict["select_node_line"] += ":gpus={gpu_per_node}".format(
                 gpu_per_node=resources.gpu_per_node
             )
-        pbs_script_header_dict["queue_name_line"] = f"#PBS -q {resources.queue_name}"
+        # pbs_script_header_dict["queue_name_line"] = f"#PBS -q {resources.queue_name}"
         if (
             resources["strategy"].get("customized_script_header_template_file")
             is not None
